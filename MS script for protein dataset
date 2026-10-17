@@ -1,0 +1,278 @@
+# =====================================================================
+# FULL PROTEOMICS ANALYSIS PIPELINE (practice) - Google Colab ready
+# File: test_proteomics_data.tsv
+# Columns: Gene Name | Control_R1-3 | Treatment_R1-3 | Potential contaminant
+# =====================================================================
+
+# ---- 0. INSTALL (run once in Colab; remove the "#" to run) ----------
+# !pip install gseapy matplotlib-venn openpyxl
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+from sklearn.decomposition import PCA
+from matplotlib_venn import venn2, venn3
+
+np.random.seed(42)
+os.makedirs("results", exist_ok=True)
+
+# ---- SETTINGS -------------------------------------------------------
+FILE = "test_proteomics_data.tsv"       # change if path differs (e.g. /content/...)
+FC_THRESHOLD = 1.0                       # log2FC = 1  ->  2-fold change
+FDR_THRESHOLD = 0.05
+P_THRESHOLD = 0.05
+MIN_VALID = 2                            # min valid values per group
+
+# ---- 1. LOAD DATA ---------------------------------------------------
+df = pd.read_csv(FILE, sep="\t")
+print("Raw shape:", df.shape)
+print(df.head())
+
+# ---- 2. REMOVE CONTAMINANTS ----------------------------------------
+df = df[df["Potential contaminant"] != "+"].copy()
+print("After contaminant removal:", df.shape)
+
+control_cols = ["Control_R1", "Control_R2", "Control_R3"]
+treatment_cols = ["Treatment_R1", "Treatment_R2", "Treatment_R3"]
+sample_cols = control_cols + treatment_cols
+
+data = df[["Gene Name"] + sample_cols].set_index("Gene Name")
+
+# ---- 3. ZEROS -> NaN, LOG2 TRANSFORMATION ---------------------------
+data = data.replace(0, np.nan)
+log2_data = np.log2(data)
+
+# ---- 4. FILTER MISSING VALUES --------------------------------------
+keep = (log2_data[control_cols].notna().sum(axis=1) >= MIN_VALID) & \
+       (log2_data[treatment_cols].notna().sum(axis=1) >= MIN_VALID)
+log2_data = log2_data[keep]
+print("After missing-value filter:", log2_data.shape)
+
+# Keep a copy BEFORE imputation (used for Venn and final selection)
+log2_raw_valid = log2_data.copy()
+
+# ---- 5. SAMPLE NORMALIZATION (median normalization) ----------------
+medians = log2_data.median()
+log2_norm = log2_data - medians + medians.mean()
+
+fig, ax = plt.subplots(1, 2, figsize=(12, 4))
+log2_data.boxplot(ax=ax[0]); ax[0].set_title("Before normalization")
+log2_norm.boxplot(ax=ax[1]); ax[1].set_title("After median normalization")
+for a in ax:
+    a.tick_params(axis="x", rotation=45)
+plt.tight_layout()
+plt.savefig("results/normalization_boxplot.png", dpi=300)
+plt.show()
+
+# ---- 6. IMPUTATION (down-shifted normal distribution) --------------
+def impute_missing(series):
+    series = series.copy()
+    mask = series.isna()
+    if mask.sum() > 0:
+        mu, sd = series.mean(), series.std()
+        series[mask] = np.random.normal(mu - 1.8 * sd, 0.3 * sd, mask.sum())
+    return series
+
+log2_imp = log2_norm.apply(impute_missing, axis=0)
+
+# ---- 7. FOLD CHANGE + T-TEST ---------------------------------------
+ctrl = log2_imp[control_cols].values
+trt = log2_imp[treatment_cols].values
+
+log2_fc = trt.mean(axis=1) - ctrl.mean(axis=1)
+t_stat, p_vals = stats.ttest_ind(trt, ctrl, axis=1, equal_var=False)  # Welch t-test
+
+results = pd.DataFrame({
+    "Gene": log2_imp.index,
+    "Mean_Control_log2": ctrl.mean(axis=1),
+    "Mean_Treatment_log2": trt.mean(axis=1),
+    "Log2_Fold_Change": log2_fc,
+    "Fold_Change": 2 ** log2_fc,
+    "t_statistic": t_stat,
+    "p_value": p_vals,
+}).set_index("Gene")
+results["p_value"] = results["p_value"].fillna(1)
+
+# ---- 8. FDR CORRECTION (Benjamini-Hochberg) -------------------------
+results["FDR_q_value"] = stats.false_discovery_control(results["p_value"], method="bh")
+
+# ---- 9. UP / DOWN REGULATED ----------------------------------------
+results["Regulation"] = "Not significant"
+results.loc[(results["Log2_Fold_Change"] >= FC_THRESHOLD) &
+            (results["FDR_q_value"] < FDR_THRESHOLD), "Regulation"] = "Up"
+results.loc[(results["Log2_Fold_Change"] <= -FC_THRESHOLD) &
+            (results["FDR_q_value"] < FDR_THRESHOLD), "Regulation"] = "Down"
+
+up = results[results["Regulation"] == "Up"].sort_values("FDR_q_value")
+down = results[results["Regulation"] == "Down"].sort_values("FDR_q_value")
+print(f"Up-regulated: {len(up)} | Down-regulated: {len(down)}")
+
+# Save Excel files (separate files + one combined workbook)
+up.to_excel("results/upregulated_genes.xlsx")
+down.to_excel("results/downregulated_genes.xlsx")
+with pd.ExcelWriter("results/all_results.xlsx") as writer:
+    results.sort_values("FDR_q_value").to_excel(writer, sheet_name="All_results")
+    up.to_excel(writer, sheet_name="Upregulated")
+    down.to_excel(writer, sheet_name="Downregulated")
+
+# ---- 10. VOLCANO PLOT ----------------------------------------------
+plt.figure(figsize=(7, 6))
+colors = results["Regulation"].map({"Up": "red", "Down": "blue", "Not significant": "grey"})
+plt.scatter(results["Log2_Fold_Change"], -np.log10(results["FDR_q_value"].clip(lower=1e-300)),
+            c=colors, s=15, alpha=0.7)
+plt.axvline(FC_THRESHOLD, ls="--", c="k", lw=0.8)
+plt.axvline(-FC_THRESHOLD, ls="--", c="k", lw=0.8)
+plt.axhline(-np.log10(FDR_THRESHOLD), ls="--", c="k", lw=0.8)
+plt.xlabel("Log2 Fold Change (Treatment / Control)")
+plt.ylabel("-log10(FDR)")
+plt.title("Volcano plot")
+plt.tight_layout()
+plt.savefig("results/volcano_plot.png", dpi=300)
+plt.show()
+
+# ---- 11. PCA --------------------------------------------------------
+X = log2_imp[sample_cols].T.values
+pca = PCA(n_components=2)
+pcs = pca.fit_transform(X)
+pca_df = pd.DataFrame(pcs, columns=["PC1", "PC2"], index=sample_cols)
+pca_df["Group"] = ["Control"] * 3 + ["Treatment"] * 3
+
+plt.figure(figsize=(6, 5))
+sns.scatterplot(data=pca_df, x="PC1", y="PC2", hue="Group", s=150)
+for name, row in pca_df.iterrows():
+    plt.text(row["PC1"], row["PC2"], name, fontsize=8, ha="left", va="bottom")
+plt.xlabel(f"PC1 ({pca.explained_variance_ratio_[0]*100:.1f}%)")
+plt.ylabel(f"PC2 ({pca.explained_variance_ratio_[1]*100:.1f}%)")
+plt.title("PCA of samples")
+plt.tight_layout()
+plt.savefig("results/pca_plot.png", dpi=300)
+plt.show()
+
+# ---- 12. HEATMAP (significant genes, z-score per gene) --------------
+sig_genes = results[results["Regulation"] != "Not significant"].index
+if len(sig_genes) > 1:
+    heat = log2_imp.loc[sig_genes, sample_cols]
+    sns.clustermap(heat, z_score=0, cmap="vlag", figsize=(7, 10),
+                   yticklabels=len(sig_genes) <= 60, col_cluster=False)
+    plt.savefig("results/heatmap_significant_genes.png", dpi=300, bbox_inches="tight")
+    plt.show()
+
+# ---- 13. VENN DIAGRAMS ----------------------------------------------
+# (a) Genes detected in Control vs Treatment (valid in >=2 replicates, before imputation)
+det_ctrl = set(log2_raw_valid.index[log2_raw_valid[control_cols].notna().sum(axis=1) >= MIN_VALID])
+det_trt = set(log2_raw_valid.index[log2_raw_valid[treatment_cols].notna().sum(axis=1) >= MIN_VALID])
+
+# (b) Overlap of the three filters
+set_p = set(results.index[results["p_value"] < P_THRESHOLD])
+set_fdr = set(results.index[results["FDR_q_value"] < FDR_THRESHOLD])
+set_fc = set(results.index[results["Log2_Fold_Change"].abs() >= FC_THRESHOLD])
+
+fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+venn2([det_ctrl, det_trt], set_labels=("Control", "Treatment"), ax=ax[0])
+ax[0].set_title("Detected genes")
+venn3([set_p, set_fdr, set_fc],
+      set_labels=("p < 0.05", "FDR < 0.05", "|log2FC| ≥ 1"), ax=ax[1])
+ax[1].set_title("Filter overlap")
+plt.tight_layout()
+plt.savefig("results/venn_diagrams.png", dpi=300)
+plt.show()
+
+# ---- 14. GENE ONTOLOGY + PATHWAY ENRICHMENT (UP and DOWN separately)
+# NOTE: needs internet and REAL gene symbols (e.g. TP53, AKT1).
+# This test file uses names like GENE_001, so enrichment will return nothing.
+# With real data, it works as written.
+import gseapy as gp
+
+LIBRARIES = ["GO_Biological_Process_2023", "GO_Molecular_Function_2023",
+             "GO_Cellular_Component_2023", "KEGG_2021_Human", "Reactome_2022"]
+
+def run_enrichment(gene_list, label):
+    if len(gene_list) < 3:
+        print(f"[{label}] too few genes for enrichment.")
+        return None
+    try:
+        enr = gp.enrichr(gene_list=list(gene_list), gene_sets=LIBRARIES,
+                         organism="human", outdir=None)
+        res = enr.results
+        res = res[res["Adjusted P-value"] < 0.05].sort_values("Adjusted P-value")
+        if res.empty:
+            print(f"[{label}] no significant terms (check that names are real gene symbols).")
+            return None
+        res.to_excel(f"results/enrichment_{label}.xlsx", index=False)
+
+        top = res.head(15).copy()
+        top["-log10(adj P)"] = -np.log10(top["Adjusted P-value"])
+        plt.figure(figsize=(9, 6))
+        sns.barplot(data=top, x="-log10(adj P)", y="Term", hue="Gene_set", dodge=False)
+        plt.title(f"Top enriched terms - {label}")
+        plt.tight_layout()
+        plt.savefig(f"results/enrichment_{label}.png", dpi=300)
+        plt.show()
+        return res
+    except Exception as e:
+        print(f"[{label}] enrichment failed: {e}")
+        return None
+
+enr_up = run_enrichment(up.index, "Upregulated")
+enr_down = run_enrichment(down.index, "Downregulated")
+
+# ---- 15. COG CLASSIFICATION (optional) ------------------------------
+# COG categories need an annotation file, e.g. from eggNOG-mapper, with columns:
+#   Gene Name <tab> COG_category   (single letters: J, K, L, C, E, G, ...)
+COG_FILE = "cog_annotation.tsv"
+if os.path.exists(COG_FILE):
+    cog = pd.read_csv(COG_FILE, sep="\t").set_index("Gene Name")
+    cog_up = cog.reindex(up.index)["COG_category"].dropna().str.split("").explode()
+    cog_down = cog.reindex(down.index)["COG_category"].dropna().str.split("").explode()
+    cog_df = pd.DataFrame({"Up": cog_up[cog_up != ""].value_counts(),
+                           "Down": cog_down[cog_down != ""].value_counts()}).fillna(0)
+    cog_df.plot(kind="bar", figsize=(10, 5), color=["red", "blue"])
+    plt.ylabel("Number of genes"); plt.title("COG categories")
+    plt.tight_layout()
+    plt.savefig("results/cog_categories.png", dpi=300)
+    plt.show()
+else:
+    print(f"COG skipped: '{COG_FILE}' not found (needs an annotation file).")
+
+# ---- 16. FINAL GENE SELECTION FOR RT-qPCR VALIDATION ----------------
+# Criteria: significant (FDR<0.05, |log2FC|>=1), measured in ALL 6 samples
+# (no missing values = no imputed numbers), low replicate variation (CV),
+# and good abundance (above median intensity).
+sel = results[results["Regulation"] != "Not significant"].copy()
+
+all_valid = log2_raw_valid.notna().all(axis=1)
+sel["Fully_measured"] = all_valid.reindex(sel.index).fillna(False)
+
+raw_linear = data.loc[sel.index, sample_cols]
+sel["CV_Control_%"] = raw_linear[control_cols].std(axis=1) / raw_linear[control_cols].mean(axis=1) * 100
+sel["CV_Treatment_%"] = raw_linear[treatment_cols].std(axis=1) / raw_linear[treatment_cols].mean(axis=1) * 100
+
+abundance = log2_norm.loc[sel.index, sample_cols].mean(axis=1)
+sel["High_abundance"] = abundance > log2_norm.mean(axis=1).median()
+
+final = sel[(sel["Fully_measured"]) &
+            (sel["CV_Control_%"] < 40) & (sel["CV_Treatment_%"] < 40) &
+            (sel["High_abundance"])].copy()
+
+# Rank: strongest fold change + best FDR
+final["Score"] = final["Log2_Fold_Change"].abs() * -np.log10(final["FDR_q_value"].clip(lower=1e-300))
+final = final.sort_values("Score", ascending=False)
+
+top_up = final[final["Regulation"] == "Up"].head(5)
+top_down = final[final["Regulation"] == "Down"].head(5)
+qpcr_targets = pd.concat([top_up, top_down])
+
+with pd.ExcelWriter("results/qPCR_validation_targets.xlsx") as writer:
+    qpcr_targets.to_excel(writer, sheet_name="Top_targets")
+    final.to_excel(writer, sheet_name="All_candidates")
+
+print("\n=== Final genes for RT-qPCR validation ===")
+print(qpcr_targets[["Log2_Fold_Change", "Fold_Change", "p_value", "FDR_q_value",
+                    "CV_Control_%", "CV_Treatment_%", "Regulation"]])
+
+# ---- 17. DOWNLOAD RESULTS (Colab) -----------------------------------
+# import shutil; shutil.make_archive("results", "zip", "results")
+# from google.colab import files; files.download("results.zip")
