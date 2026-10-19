@@ -1,0 +1,160 @@
+"""
+Simulates a rice (Oryza sativa subsp. japonica) TMT10plex experiment as exported
+from Proteome Discoverer (protein level, tab-delimited).
+
+Design: salt-stress vs control, 5 time points (1, 3, 6, 12, 24 h),
+3 biological replicates. Each replicate = one TMT10plex (10 channels).
+Channels are NOT labelled with sample names in the protein files (as in real
+exports) - use sample_annotation.csv to map them.
+"""
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(2026)
+N_PROT = 2600
+TIMES = [1, 3, 6, 12, 24]
+CHANNELS = ["126", "127N", "127C", "128N", "128C", "129N", "129C", "130N", "130C", "131"]
+
+# ---------------- sample annotation (channel map) ----------------
+rows = []
+for plex in (1, 2, 3):
+    ch = 0
+    for t in TIMES:
+        for cond in ("Control", "Treatment"):
+            rows.append(dict(Plex=f"Plex{plex}", Channel=CHANNELS[ch],
+                             Sample_ID=f"{cond[0]}_{t}h_R{plex}",
+                             Condition=cond, Timepoint_h=t, BioRep=f"R{plex}"))
+            ch += 1
+annot = pd.DataFrame(rows)
+annot.to_csv("sample_annotation.csv", index=False)
+
+# ---------------- protein table ----------------
+families = ["Heat shock protein 70", "Heat shock protein 90", "Late embryogenesis abundant protein",
+            "Superoxide dismutase [Cu-Zn]", "L-ascorbate peroxidase", "Catalase isozyme",
+            "Glutathione S-transferase", "Dehydrin", "Aquaporin PIP", "Sodium/hydrogen exchanger",
+            "High-affinity K+ transporter", "Ribulose bisphosphate carboxylase small chain",
+            "Chlorophyll a-b binding protein", "Photosystem II protein D1", "ATP synthase subunit beta",
+            "Glyceraldehyde-3-phosphate dehydrogenase", "Fructose-bisphosphate aldolase",
+            "Pyruvate kinase", "60S ribosomal protein L", "40S ribosomal protein S",
+            "Elongation factor 1-alpha", "Tubulin alpha chain", "Actin", "Peroxiredoxin",
+            "Calmodulin", "Serine/threonine-protein kinase", "Pathogenesis-related protein",
+            "Expressed protein", "Putative uncharacterized protein", "Glycine-rich RNA-binding protein",
+            "Proline-rich protein", "Beta-glucosidase", "Cytochrome P450", "Zinc finger protein"]
+stress_kw = ["Heat shock", "Late embryogenesis", "Superoxide", "peroxidase", "Catalase",
+             "Glutathione", "Dehydrin", "Peroxiredoxin", "Pathogenesis", "Proline-rich"]
+photo_kw = ["Ribulose", "Chlorophyll", "Photosystem"]
+
+letters = np.array(list("ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
+used, acc = set(), []
+while len(acc) < N_PROT:
+    a = (rng.choice(["Q", "P", "O"]) + str(rng.integers(0, 10)) + "".join(rng.choice(letters, 3))
+         + str(rng.integers(0, 10)))
+    if a not in used:
+        used.add(a); acc.append(a)
+
+desc, gene, is_stress, is_photo = [], [], [], []
+for i in range(N_PROT):
+    f = rng.choice(families)
+    chrom = rng.integers(1, 13)
+    gid = f"Os{chrom:02d}g{rng.integers(1, 9999):04d}00"
+    suffix = f" {rng.integers(1, 12)}" if f.endswith(("L", "S", "PIP")) else ""
+    desc.append(f"{f}{suffix} OS=Oryza sativa subsp. japonica OX=39947 GN={gid} PE={rng.integers(1,5)} SV=1")
+    gene.append(gid)
+    is_stress.append(any(k in f for k in stress_kw)); is_photo.append(any(k in f for k in photo_kw))
+is_stress, is_photo = np.array(is_stress), np.array(is_photo)
+
+# true log2 effects (Treatment vs Control) per time point
+eff = np.zeros((N_PROT, len(TIMES)))
+idx = rng.permutation(N_PROT)
+early_up = np.where(is_stress)[0]
+rng.shuffle(early_up)
+early_up = early_up[: int(len(early_up) * 0.6)]
+late_up = rng.choice(idx, 90, replace=False)
+down = np.where(is_photo)[0].tolist() + rng.choice(idx, 70, replace=False).tolist()
+down = np.unique(down)
+for p in early_up:
+    a = rng.uniform(1.4, 2.6); eff[p] = a * np.array([0.6, 1.0, 0.8, 0.5, 0.3])
+for p in late_up:
+    a = rng.uniform(1.4, 2.4); eff[p] = a * np.array([0.0, 0.2, 0.5, 0.9, 1.0])
+for p in down:
+    a = rng.uniform(1.3, 2.2); eff[p] = -a * np.array([0.1, 0.3, 0.6, 0.9, 1.0])
+
+base = rng.normal(20.0, 2.0, N_PROT)                 # log2 abundance
+base -= 0.3 * np.clip(base - 24, 0, None)
+time_drift = rng.normal(0, 0.15, (N_PROT, len(TIMES)))  # shared by C and T
+
+# contaminants
+contam = [("P35527", "Keratin, type I cytoskeletal 9 OS=Homo sapiens OX=9606 GN=KRT9 PE=1 SV=3"),
+          ("P13645", "Keratin, type I cytoskeletal 10 OS=Homo sapiens OX=9606 GN=KRT10 PE=1 SV=6"),
+          ("P04264", "Keratin, type II cytoskeletal 1 OS=Homo sapiens OX=9606 GN=KRT1 PE=1 SV=6"),
+          ("P35908", "Keratin, type II cytoskeletal 2 epidermal OS=Homo sapiens OX=9606 GN=KRT2 PE=1 SV=2"),
+          ("P02769", "Serum albumin OS=Bos taurus OX=9913 GN=ALB PE=1 SV=4"),
+          ("P00761", "Trypsin OS=Sus scrofa OX=9823 PE=1 SV=1")]
+n_c = len(contam)
+
+plex_effect = rng.normal(0, 0.25, (N_PROT + n_c, 3))   # protein x plex variation
+load_bias = {p: rng.normal(0, 0.12, 10) for p in range(3)}  # channel loading bias
+plex_scale = [0.0, 0.5, -0.4]
+
+all_acc = acc + [c[0] for c in contam]
+all_desc = desc + [c[1] for c in contam]
+all_base = np.concatenate([base, rng.normal(22, 1.5, n_c)])
+
+# mass-spec descriptors
+npept = np.clip(rng.negative_binomial(2, 0.25, N_PROT + n_c) + 1, 1, 60)
+psm = npept + rng.poisson(npept * 1.8)
+uniq = np.clip((npept * rng.uniform(0.5, 1.0, N_PROT + n_c)).astype(int), 0, None)
+cov = np.clip(npept * rng.uniform(1.5, 4.0, N_PROT + n_c), 0.5, 95).round(1)
+mw = rng.lognormal(np.log(45), 0.5, N_PROT + n_c).round(1)
+pI = np.clip(rng.normal(6.6, 1.6, N_PROT + n_c), 3.5, 11.5).round(2)
+naa = (mw * 1000 / 110).astype(int)
+fdr_conf = np.where(npept >= 2, "High", rng.choice(["High", "Medium", "Low"], N_PROT + n_c, p=[.4, .3, .3]))
+qval = np.where(fdr_conf == "High", rng.uniform(0, 0.008, N_PROT + n_c),
+                rng.uniform(0.01, 0.2, N_PROT + n_c)).round(4)
+pep_score = (npept * rng.uniform(8, 60, N_PROT + n_c)).round(2)
+master = np.where(rng.random(N_PROT + n_c) < 0.93, "IsMasterProtein", "Master Protein Candidate")
+is_contam = np.array([False] * N_PROT + [True] * n_c)
+
+for p in range(3):
+    mat = np.zeros((N_PROT + n_c, 10))
+    ch = 0
+    for ti, t in enumerate(TIMES):
+        for cond in ("C", "T"):
+            e = np.zeros(N_PROT + n_c)
+            if cond == "T":
+                e[:N_PROT] = eff[:, ti] * 0.85       # ratio compression (TMT)
+            mat[:, ch] = (all_base + plex_scale[p]
+                          + np.concatenate([time_drift[:, ti], np.zeros(n_c)])
+                          + plex_effect[:, p] + e + load_bias[p][ch]
+                          + rng.normal(0, 0.09, N_PROT + n_c))
+            ch += 1
+    inten = 2 ** mat
+    low = mat < np.percentile(mat, 4)                 # low-abundance dropout
+    inten[low & (rng.random(mat.shape) < 0.5)] = np.nan
+    inten[rng.random(mat.shape) < 0.012] = np.nan     # random channel dropout
+    absent = rng.random(N_PROT + n_c) < 0.07          # protein not seen in this plex
+    inten[absent, :] = np.nan
+
+    out = pd.DataFrame({
+        "Checked": "FALSE",
+        "Protein FDR Confidence: Combined": fdr_conf,
+        "Master": master,
+        "Accession": all_acc,
+        "Description": all_desc,
+        "Exp. q-value: Combined": qval,
+        "Sum PEP Score": pep_score,
+        "Coverage [%]": cov,
+        "# Peptides": npept,
+        "# PSMs": psm,
+        "# Unique Peptides": uniq,
+        "# AAs": naa,
+        "MW [kDa]": mw,
+        "calc. pI": pI,
+        "Contaminant": np.where(is_contam, "TRUE", "FALSE"),
+    })
+    for c, name in enumerate(CHANNELS):
+        out[f"Abundance: F1: {name}, Sample"] = inten[:, c].round(1)
+    seen = ~np.isnan(inten).all(axis=1)
+    out = out[seen].sample(frac=1, random_state=p).reset_index(drop=True)
+    out.to_csv(f"rice_TMT10_Plex{p+1}_Proteins.txt", sep="\t", index=False)
+    print(f"Plex{p+1}: {out.shape}")
